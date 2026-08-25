@@ -1,0 +1,7 @@
+node_modules/
+*.zip
+deploy/out/
+.env
+npm-debug.log*
+.DS_Store
+Thumbs.db

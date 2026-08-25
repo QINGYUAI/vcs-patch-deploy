@@ -1,0 +1,58 @@
+{
+  "name": "vcs-patch-deploy",
+  "version": "1.0.1",
+  "description": "PHP 后端（ThinkPHP）增量部署包生成工具 — 支持 SVN revision 与 Git commit 差异对比，打 zip 并附带 apply-update.php，供堡垒机/Web 终端上线",
+  "main": "lib/index.js",
+  "bin": {
+    "patch-build": "bin/patch-build.js"
+  },
+  "scripts": {
+    "test": "node bin/patch-build.js --help",
+    "prepublishOnly": "node -e \"require('./lib/index.js')\""
+  },
+  "keywords": [
+    "svn",
+    "git",
+    "deploy",
+    "patch",
+    "incremental",
+    "vcs",
+    "zip",
+    "php",
+    "thinkphp",
+    "bastion",
+    "cli",
+    "增量部署",
+    "堡垒机"
+  ],
+  "author": "qingyuai",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "chalk": "^4.1.2",
+    "fs-extra": "^11.3.0"
+  },
+  "optionalDependencies": {
+    "dotenv": "^16.6.1"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "assets/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "env.example"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/QINGYUAI/vcs-patch-deploy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/QINGYUAI/vcs-patch-deploy/issues"
+  },
+  "homepage": "https://github.com/QINGYUAI/vcs-patch-deploy#readme"
+}

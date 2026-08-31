@@ -33,6 +33,9 @@ ${chalk.yellow('选项:')}
   --init                初始化 deploy 目录结构
   --skip-validation     跳过 PHP 项目结构校验
   --zip-prefix=<前缀>   zip 前缀（默认 backend-update）
+  --version=<版本号>    安装版本号（如 1.2.3，写入 VERSION.txt 与 versions.json）
+  --only=<文件>         仅打包指定文件（逗号分隔，可重复；支持 @files.txt）
+  --file-list=<文件>    文件列表（每行一个相对路径）
   -h, --help            显示帮助
 
 ${chalk.yellow('环境变量:')}
@@ -41,6 +44,14 @@ ${chalk.yellow('环境变量:')}
   PATCH_SOURCE_DIR      源码根
   PATCH_DEPLOY_DIR      deploy 目录
   PATCH_ZIP_PREFIX      zip 前缀
+  PATCH_VERSION         安装版本号
+  PATCH_FILE_LIST       仅打包的文件列表路径
+
+${chalk.yellow('版本号 + 单独文件部署:')}
+  patch-build --vcs=svn --version=1.2.3
+  patch-build --vcs=svn --version=1.2.3 --only=app/service/Foo.php
+  patch-extract --version=1.2.3 --only=app/service/Foo.php,app/controller/Bar.php
+  patch-extract --list-versions
 
 ${chalk.yellow('ThinkPHP + SVN:')}
   cd /path/to/your-php-api
@@ -59,7 +70,7 @@ ${chalk.yellow('服务器应用:')}
 
 function parseArgs () {
   const args = process.argv.slice(2)
-  const opts = { showHelp: false }
+  const opts = { showHelp: false, onlyFiles: [] }
 
   for (const arg of args) {
     if (arg === '--help' || arg === '-h') opts.showHelp = true
@@ -74,6 +85,9 @@ function parseArgs () {
     else if (arg.startsWith('--from=')) opts.fromRef = arg.split('=')[1]
     else if (arg.startsWith('--to=')) opts.toRef = arg.split('=')[1]
     else if (arg.startsWith('--zip-prefix=')) opts.zipPrefix = arg.split('=')[1]
+    else if (arg.startsWith('--version=')) opts.version = arg.split('=')[1]
+    else if (arg.startsWith('--only=')) opts.onlyFiles.push(...arg.split('=')[1].split(','))
+    else if (arg.startsWith('--file-list=')) opts.fileList = arg.split('=')[1]
     else console.warn(chalk.yellow(`未知参数: ${arg}`))
   }
 
@@ -98,6 +112,9 @@ async function main () {
     markDeployed: opts.markDeployed,
     skipValidation: opts.skipValidation,
     zipPrefix: opts.zipPrefix,
+    version: opts.version,
+    onlyFiles: opts.onlyFiles,
+    fileList: opts.fileList,
     pkgRoot: path.join(__dirname, '..')
   })
 
@@ -136,6 +153,9 @@ async function main () {
 
   if (!result.skipped && !opts.markDeployed) {
     console.log(chalk.cyan('\n下一步: 上传 zip → 解压 → php apply-update.php <Backend根目录>'))
+    if (result.version) {
+      console.log(chalk.cyan(`  子集提取: patch-extract --version=${result.version} --only=<文件>`))
+    }
   }
 
   process.exit(result.success ? 0 : 1)

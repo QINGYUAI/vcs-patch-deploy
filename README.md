@@ -18,7 +18,7 @@ npx patch-build --help
 
 ## 快速开始（ThinkPHP + SVN）
 
-在 **PHP 项目根目录**（含 `app/`、`config/` 或 `think`）执行：
+在 **PHP 项目根目录**（含 `app/`、`application/`、`config/` 或 `think`）执行：
 
 ```bash
 cd /path/to/your-php-api

@@ -472,6 +472,77 @@ function tryThinkClear(string $backendRoot): void
     }
 }
 
+/**
+ * 识别 Backend 根目录布局
+ * - ThinkPHP 6+：app/
+ * - ThinkPHP 5：application/
+ * - 兜底：config/、think、composer.json，或 patch 首级目录与线上对齐
+ *
+ * @param list<string> $patchFiles
+ * @return array{valid: bool, layout: string, markers: list<string>}
+ */
+function validateBackendRoot(string $backendRoot, array $patchFiles = []): array
+{
+    /** @var list<string> $markers */
+    $markers = [];
+
+    if (is_dir($backendRoot . '/app')) {
+        $markers[] = 'app/';
+    }
+    if (is_dir($backendRoot . '/application')) {
+        $markers[] = 'application/';
+    }
+    if (is_dir($backendRoot . '/config')) {
+        $markers[] = 'config/';
+    }
+    if (is_file($backendRoot . '/think')) {
+        $markers[] = 'think';
+    }
+    if (is_file($backendRoot . '/composer.json')) {
+        $markers[] = 'composer.json';
+    }
+
+    if (is_dir($backendRoot . '/app')) {
+        return ['valid' => true, 'layout' => 'thinkphp6', 'markers' => $markers];
+    }
+    if (is_dir($backendRoot . '/application')) {
+        return ['valid' => true, 'layout' => 'thinkphp5', 'markers' => $markers];
+    }
+    if (is_file($backendRoot . '/think') || is_dir($backendRoot . '/config')) {
+        return ['valid' => true, 'layout' => 'thinkphp-legacy', 'markers' => $markers];
+    }
+    if (is_file($backendRoot . '/composer.json')) {
+        return ['valid' => true, 'layout' => 'php-composer', 'markers' => $markers];
+    }
+
+    // 根据 patch 内路径首段推断（兼容非标准旧版目录）
+    /** @var array<string, true> $topLevels */
+    $topLevels = [];
+    foreach ($patchFiles as $rel) {
+        $parts = explode('/', $rel, 2);
+        if ($parts[0] !== '') {
+            $topLevels[$parts[0]] = true;
+        }
+    }
+    /** @var list<string> $matchedTops */
+    $matchedTops = [];
+    foreach (array_keys($topLevels) as $top) {
+        $candidate = $backendRoot . '/' . str_replace('/', DIRECTORY_SEPARATOR, $top);
+        if (is_dir($candidate) || is_file($candidate)) {
+            $matchedTops[] = $top . '/';
+        }
+    }
+    if ($matchedTops !== []) {
+        return [
+            'valid' => true,
+            'layout' => 'patch-inferred',
+            'markers' => array_values(array_unique([...$markers, ...$matchedTops])),
+        ];
+    }
+
+    return ['valid' => false, 'layout' => 'unknown', 'markers' => $markers];
+}
+
 // --- main ---
 
 $backendRoot = resolveBackendRoot();
@@ -481,8 +552,22 @@ if (!is_dir($backendRoot)) {
     exit(1);
 }
 
-if (!is_dir($backendRoot . '/app')) {
-    fwrite(STDERR, "目标不像 Backend 根目录（缺少 app/）: {$backendRoot}\n");
+$files = listPatchFiles();
+if ($files === []) {
+    echo "patch 包内无待部署文件。\n";
+    exit(0);
+}
+
+$rootCheck = validateBackendRoot($backendRoot, $files);
+if (!$rootCheck['valid']) {
+    fwrite(STDERR, "目标不像 Backend 根目录（缺少 app/、application/ 或与 patch 对应的首级目录）: {$backendRoot}\n");
+    if ($rootCheck['markers'] !== []) {
+        fwrite(STDERR, '已检测到: ' . implode(', ', $rootCheck['markers']) . "\n");
+    }
+    $sample = $files[0] ?? '';
+    if ($sample !== '') {
+        fwrite(STDERR, "patch 示例路径: {$sample}，请确认 SITE_ROOT 指向该路径的父级项目根\n");
+    }
     exit(1);
 }
 
@@ -496,6 +581,11 @@ $runUser = function_exists('posix_getpwuid')
 
 echo "PATCH_ROOT: " . PATCH_ROOT . "\n";
 echo "BACKEND_ROOT: {$backendRoot}\n";
+echo "LAYOUT: {$rootCheck['layout']}";
+if ($rootCheck['markers'] !== []) {
+    echo ' (' . implode(', ', $rootCheck['markers']) . ')';
+}
+echo "\n";
 echo "RUN_AS: {$runUser}\n";
 if ($dryRun) {
     echo "MODE: check-only（不写入文件）\n";
@@ -505,8 +595,6 @@ if ($noBackup) {
 } elseif ($backupEnabled) {
     echo "BACKUP: enabled -> " . resolveBackupRoot($backendRoot) . "/<timestamp>/\n";
 }
-
-$files = listPatchFiles();
 
 try {
     $fileFilter = resolveDeployFileFilter();
@@ -526,7 +614,7 @@ if ($fileFilter !== null) {
 }
 
 if ($files === []) {
-    echo "patch 包内无待部署文件。\n";
+    echo "筛选后无待部署文件。\n";
     exit(0);
 }
 
@@ -576,18 +664,19 @@ foreach ($files as $rel) {
 
 if ($fail > 0) {
     $phpBin = detectPhpBinary();
+    $sampleRel = $blocked[0] ?? ($files[0] ?? 'path/to/file.php');
     echo "\n--- 权限排查 ---\n";
-    echo "当前终端用户「{$runUser}」无法覆盖 app/ 下 PHP 文件（runtime/cache 可写不代表源码可写）。\n";
+    echo "当前终端用户「{$runUser}」无法覆盖源码文件（runtime/cache 可写不代表源码可写）。\n";
     echo "源码属主与 PHP-FPM 不一致时较常见：Web 终端用户与 php-fpm 运行用户不同。\n";
-    echo "建议: sudo chown -R {$runUser}:{$runUser} {$backendRoot}/app 后，再以 {$runUser} 执行本脚本；或 sudo cp 覆盖。\n";
+    echo "建议: sudo chown -R {$runUser}:{$runUser} {$backendRoot} 后，再以 {$runUser} 执行本脚本；或 sudo cp 覆盖。\n";
     echo "请在 Backend 根目录执行：\n";
     echo "  whoami\n";
-    echo "  ls -ln app/service/admin/AdminAuthService.php\n";
+    echo "  ls -ln {$sampleRel}\n";
     echo "  ps aux | grep php-fpm | head -3\n";
     echo "  command -v php\n";
     echo "常见处理方式（择一，需运维配合）：\n";
-    echo "  1) sudo chown -R {$runUser}:{$runUser} {$backendRoot}/app && {$phpBin} apply-update.php {$backendRoot}\n";
-    echo "  2) sudo cp -f app/service/... {$backendRoot}/app/service/...（在 patch 目录内）\n";
+    echo "  1) sudo chown -R {$runUser}:{$runUser} {$backendRoot} && {$phpBin} apply-update.php {$backendRoot}\n";
+    echo "  2) sudo cp -f {$sampleRel} {$backendRoot}/{$sampleRel}（在 patch 目录内）\n";
     echo "  3) 请运维在面板/堡垒机代为覆盖 patch 内文件\n";
     echo "注意: 勿假设固定系统用户（如 nginx/www），以 whoami 与 ls -ln 实际属主为准。\n";
     if ($blocked !== []) {
@@ -610,8 +699,9 @@ clearRuntimeCache($backendRoot);
 tryThinkClear($backendRoot);
 
 if ($backupSessionDir !== null) {
+    $sampleRel = $files[0] ?? 'path/to/file.php';
     echo "\n已备份 {$backedUp} 个旧文件至: {$backupSessionDir}\n";
-    echo "回滚示例: cp -f {$backupSessionDir}/app/... {$backendRoot}/app/...\n";
+    echo "回滚示例: cp -f {$backupSessionDir}/{$sampleRel} {$backendRoot}/{$sampleRel}\n";
 }
 
 $deletedList = PATCH_ROOT . '/MANIFEST-deleted.txt';

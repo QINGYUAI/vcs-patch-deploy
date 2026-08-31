@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1
+
+### 修复
+
+- `apply-update.php`：兼容 ThinkPHP 5（`application/`）及 patch 路径推断，不再强制要求 `app/`
+- `validatePhpBackend`：识别 `application/` 旧版目录结构
+
+## Unreleased
+
 ## 1.1.0
 
 ### 新增
@@ -17,8 +26,6 @@
 - `build-patch`：staging 目录构建，失败不破坏旧 patch；SVN revision NaN 校验
 - `git.js`：Git 未安装时 `detectVcs` 不再崩溃；支持类型变更 diff
 - zip 默认压缩级别 6（可通过 `PATCH_ZIP_LEVEL` 调整）
-
-## Unreleased
 
 ## 1.0.1
 

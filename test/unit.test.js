@@ -95,6 +95,20 @@ test('readManifestFiles 解析 # files 段', () => {
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
+test('validatePhpBackend 兼容 ThinkPHP 5 application/', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'patch-test-'))
+  fs.mkdirSync(path.join(tmp, 'application', 'admin'), { recursive: true })
+  fs.mkdirSync(path.join(tmp, 'public'), { recursive: true })
+  fs.writeFileSync(path.join(tmp, 'application', 'admin', 'Index.php'), '<?php', 'utf8')
+
+  const { validatePhpBackend } = require('../lib/backends/php')
+  const result = validatePhpBackend(tmp)
+  assert.equal(result.valid, true)
+  assert.equal(result.framework, 'thinkphp')
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
 test('registerVersion 原子写入并可读取', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'patch-test-'))
   registerVersion(tmp, {

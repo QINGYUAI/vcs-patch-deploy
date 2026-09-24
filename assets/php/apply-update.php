@@ -10,7 +10,9 @@ declare(strict_types=1);
  *   PATCH_BACKEND_ROOT=/path/to/production-api php apply-update.php
  *
  * 安全：不会覆盖 .env；不会自动删除 MANIFEST-deleted.txt 中列出的文件。
- * 备份：覆盖前将线上已有文件复制到备份目录（默认 Backend/.deploy-backups/<时间戳>/）。
+ * 备份：覆盖前将线上已有文件复制到版本备份目录（默认 Backend/.deploy-backups/v1.2.2/ 或 r467/）。
+ * 回滚：php apply-update.php --rollback[=版本] <Backend根目录>
+ * 列表：php apply-update.php --list-backups <Backend根目录>
  */
 
 /** patch 包根目录（本脚本所在目录） */
@@ -18,6 +20,12 @@ const PATCH_ROOT = __DIR__;
 
 /** 默认备份目录名（位于 Backend 根下，可通过 PATCH_BACKUP_DIR 覆盖父路径） */
 const BACKUP_DIR_BASENAME = '.deploy-backups';
+
+/** 当前线上部署版本记录文件（位于 Backend 根下） */
+const DEPLOY_VERSION_FILE = '.deploy-version';
+
+/** 版本备份元数据文件名 */
+const DEPLOY_META_FILE = 'DEPLOY-META.txt';
 
 /** 部署时跳过的文件名（相对路径 basename 匹配或完整相对路径） */
 const SKIP_FILES = [
@@ -54,7 +62,7 @@ function resolveBackendRoot(): string
     }
 
     global $argv;
-    $flags = ['--check', '--dry-run', '--no-backup'];
+    $flags = ['--check', '--dry-run', '--no-backup', '--list-backups', '--rollback'];
     foreach ($argv as $i => $arg) {
         if ($i === 0) {
             continue;
@@ -65,15 +73,371 @@ function resolveBackendRoot(): string
         if (str_starts_with($arg, '--files=') || str_starts_with($arg, '--file-list=')) {
             continue;
         }
+        if (str_starts_with($arg, '--rollback=')) {
+            continue;
+        }
         if ($arg !== '' && !str_starts_with($arg, '-')) {
             return rtrim($arg, "/\\");
         }
     }
 
-    fwrite(STDERR, "用法: php apply-update.php [--check] [--files=<路径>] [--file-list=<列表>] <Backend根目录>\n");
+    fwrite(STDERR, "用法: php apply-update.php [--check] [--rollback[=版本]] [--list-backups] [--files=<路径>] <Backend根目录>\n");
     fwrite(STDERR, "示例: php apply-update.php /path/to/production-api\n");
-    fwrite(STDERR, "      php apply-update.php --files=app/service/Foo.php /path/to/production-api\n");
+    fwrite(STDERR, "      php apply-update.php --rollback /path/to/production-api\n");
+    fwrite(STDERR, "      php apply-update.php --rollback=1.2.2 /path/to/production-api\n");
+    fwrite(STDERR, "      php apply-update.php --list-backups /path/to/production-api\n");
     exit(1);
+}
+
+/**
+ * 解析 --rollback[=版本] 参数
+ *
+ * @return array{enabled: bool, target: string|null}
+ */
+function resolveRollbackOption(): array
+{
+    global $argv;
+
+    foreach ($argv ?? [] as $arg) {
+        if ($arg === '--rollback') {
+            return ['enabled' => true, 'target' => null];
+        }
+        if (str_starts_with($arg, '--rollback=')) {
+            $target = trim(substr($arg, 11));
+            if ($target === '') {
+                throw new RuntimeException('--rollback= 需要指定版本号');
+            }
+            return ['enabled' => true, 'target' => $target];
+        }
+    }
+
+    return ['enabled' => false, 'target' => null];
+}
+
+/**
+ * 清洗版本标识（与 Node sanitizeVersionLabel 对齐）
+ */
+function sanitizeVersionLabel(string $version): string
+{
+    $label = trim($version);
+    $label = preg_replace('/^v/i', '', $label) ?? $label;
+    $label = preg_replace('/[^a-zA-Z0-9._-]/', '_', $label) ?? $label;
+
+    return $label;
+}
+
+/**
+ * 读取 key=value 多行元数据文件（忽略 # 注释行）
+ *
+ * @return array<string, string>
+ */
+function readKeyValueFile(string $filePath): array
+{
+    if (!is_file($filePath)) {
+        return [];
+    }
+
+    $lines = file($filePath, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return [];
+    }
+
+    /** @var array<string, string> $meta */
+    $meta = [];
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+        $pos = strpos($trimmed, '=');
+        if ($pos === false) {
+            continue;
+        }
+        $key = trim(substr($trimmed, 0, $pos));
+        $value = trim(substr($trimmed, $pos + 1));
+        if ($key !== '') {
+            $meta[$key] = $value;
+        }
+    }
+
+    return $meta;
+}
+
+/**
+ * 从 patch 包解析本次部署版本（VERSION.txt 优先，兼容 MANIFEST revision 包）
+ */
+function resolvePatchDeployVersion(): ?string
+{
+    $versionMeta = readKeyValueFile(PATCH_ROOT . '/VERSION.txt');
+    if (isset($versionMeta['version']) && $versionMeta['version'] !== '') {
+        return sanitizeVersionLabel($versionMeta['version']);
+    }
+
+    $manifestMeta = readKeyValueFile(PATCH_ROOT . '/MANIFEST.txt');
+    if (isset($manifestMeta['version']) && $manifestMeta['version'] !== '') {
+        return sanitizeVersionLabel($manifestMeta['version']);
+    }
+    if (($manifestMeta['vcs'] ?? '') === 'svn' && isset($manifestMeta['to_revision']) && $manifestMeta['to_revision'] !== '') {
+        return 'r' . $manifestMeta['to_revision'];
+    }
+    if (isset($manifestMeta['to_commit']) && $manifestMeta['to_commit'] !== '') {
+        return substr($manifestMeta['to_commit'], 0, 12);
+    }
+
+    return null;
+}
+
+/**
+ * 备份目录名：v1.2.3 / r467 / pre-deploy
+ */
+function formatBackupDirName(string $versionLabel): string
+{
+    $label = sanitizeVersionLabel($versionLabel);
+    if ($label === 'pre-deploy') {
+        return 'pre-deploy';
+    }
+    if (preg_match('/^r\d+$/i', $label) === 1) {
+        return strtolower($label);
+    }
+    if (preg_match('/^\d/', $label) === 1) {
+        return 'v' . $label;
+    }
+
+    return $label;
+}
+
+/**
+ * 读取当前线上部署版本
+ */
+function readDeployedVersion(string $backendRoot): ?string
+{
+    $path = $backendRoot . '/' . DEPLOY_VERSION_FILE;
+    if (!is_file($path)) {
+        return null;
+    }
+
+    $value = trim((string) file_get_contents($path));
+    if ($value === '') {
+        return null;
+    }
+
+    return sanitizeVersionLabel($value);
+}
+
+/**
+ * 写入当前线上部署版本
+ */
+function writeDeployedVersion(string $backendRoot, string $versionLabel): void
+{
+    $path = $backendRoot . '/' . DEPLOY_VERSION_FILE;
+    file_put_contents($path, sanitizeVersionLabel($versionLabel) . "\n");
+}
+
+/**
+ * 创建版本备份会话目录（无版本标识时降级为时间戳目录）
+ */
+function createVersionBackupSessionDir(string $backupRoot, ?string $currentVersionLabel): string
+{
+    if ($currentVersionLabel === null || $currentVersionLabel === '') {
+        return createBackupSessionDir($backupRoot);
+    }
+
+    $sessionDir = $backupRoot . '/' . formatBackupDirName($currentVersionLabel);
+    if (is_dir($sessionDir)) {
+        // 同版本重复部署：追加时间戳子目录，避免覆盖历史备份
+        $sessionDir .= '_' . date('Y-m-d_His');
+    }
+    if (!is_dir($sessionDir) && !mkdir($sessionDir, 0755, true) && !is_dir($sessionDir)) {
+        throw new RuntimeException("无法创建版本备份目录: {$sessionDir}");
+    }
+
+    return $sessionDir;
+}
+
+/**
+ * 写入版本备份元数据
+ *
+ * @param list<string> $backedUpFiles
+ */
+function writeDeployMeta(
+    string $backupSessionDir,
+    string $versionLabel,
+    ?string $replacedBy,
+    array $backedUpFiles
+): void {
+    $lines = [
+        'version=' . sanitizeVersionLabel($versionLabel),
+        'backup_label=' . basename($backupSessionDir),
+        'backed_up_at=' . date('Y-m-d H:i:s'),
+        'file_count=' . count($backedUpFiles),
+    ];
+    if ($replacedBy !== null && $replacedBy !== '') {
+        $lines[] = 'replaced_by=' . sanitizeVersionLabel($replacedBy);
+    }
+    $lines[] = '';
+    $lines[] = '# files';
+    foreach ($backedUpFiles as $rel) {
+        $lines[] = $rel;
+    }
+
+    file_put_contents($backupSessionDir . '/' . DEPLOY_META_FILE, implode("\n", $lines) . "\n");
+}
+
+/**
+ * 读取备份目录元数据
+ *
+ * @return array<string, string>
+ */
+function readDeployMeta(string $backupSessionDir): array
+{
+    return readKeyValueFile($backupSessionDir . '/' . DEPLOY_META_FILE);
+}
+
+/**
+ * 列出备份目录内可恢复文件（排除元数据）
+ *
+ * @return list<string>
+ */
+function listBackupFiles(string $backupSessionDir): array
+{
+    if (!is_dir($backupSessionDir)) {
+        return [];
+    }
+
+    /** @var list<string> $files */
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($backupSessionDir, FilesystemIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $fileInfo) {
+        if (!$fileInfo->isFile()) {
+            continue;
+        }
+        $abs = $fileInfo->getPathname();
+        $rel = substr($abs, strlen($backupSessionDir) + 1);
+        $relNorm = str_replace('\\', '/', $rel);
+        if (in_array(basename($relNorm), [DEPLOY_META_FILE, 'MANIFEST.txt'], true)) {
+            continue;
+        }
+        $files[] = $relNorm;
+    }
+
+    sort($files);
+
+    return $files;
+}
+
+/**
+ * 列出所有版本备份
+ *
+ * @return list<array{dir: string, meta: array<string, string>, fileCount: int}>
+ */
+function listVersionBackups(string $backendRoot): array
+{
+    $backupRoot = resolveBackupRoot($backendRoot);
+    if (!is_dir($backupRoot)) {
+        return [];
+    }
+
+    /** @var list<array{dir: string, meta: array<string, string>, fileCount: int}> $items */
+    $items = [];
+    foreach (scandir($backupRoot) ?: [] as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+        $dir = $backupRoot . '/' . $name;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        $meta = readDeployMeta($dir);
+        $items[] = [
+            'dir' => $dir,
+            'meta' => $meta,
+            'fileCount' => count(listBackupFiles($dir)),
+        ];
+    }
+
+    usort($items, static function (array $a, array $b): int {
+        $timeA = $a['meta']['backed_up_at'] ?? '';
+        $timeB = $b['meta']['backed_up_at'] ?? '';
+        return $timeA < $timeB ? 1 : -1;
+    });
+
+    return $items;
+}
+
+/**
+ * 解析回滚目标备份目录
+ */
+function resolveRollbackBackupDir(string $backendRoot, ?string $targetVersion): string
+{
+    $backupRoot = resolveBackupRoot($backendRoot);
+    $currentVersion = readDeployedVersion($backendRoot);
+
+    if ($targetVersion !== null && $targetVersion !== '') {
+        $targetLabel = sanitizeVersionLabel($targetVersion);
+        $candidate = $backupRoot . '/' . formatBackupDirName($targetLabel);
+        if (!is_dir($candidate)) {
+            throw new RuntimeException("未找到版本 {$targetLabel} 的备份目录: {$candidate}");
+        }
+        return $candidate;
+    }
+
+    if ($currentVersion === null) {
+        throw new RuntimeException('当前无 .deploy-version，请使用 --rollback=<版本> 指定目标');
+    }
+
+    foreach (listVersionBackups($backendRoot) as $item) {
+        $replacedBy = $item['meta']['replaced_by'] ?? '';
+        if ($replacedBy !== '' && sanitizeVersionLabel($replacedBy) === $currentVersion) {
+            return $item['dir'];
+        }
+    }
+
+    throw new RuntimeException("未找到可回滚到上一版本的备份（当前版本 {$currentVersion}）");
+}
+
+/**
+ * 从版本备份恢复文件
+ *
+ * @return array{ok: int, fail: int, targetVersion: string}
+ */
+function rollbackFromBackup(string $backendRoot, string $backupSessionDir): array
+{
+    $meta = readDeployMeta($backupSessionDir);
+    $targetVersion = $meta['version'] ?? basename($backupSessionDir);
+    $targetVersion = sanitizeVersionLabel($targetVersion);
+
+    $files = listBackupFiles($backupSessionDir);
+    if ($files === []) {
+        throw new RuntimeException("备份目录无可用文件: {$backupSessionDir}");
+    }
+
+    $ok = 0;
+    $fail = 0;
+    foreach ($files as $rel) {
+        $src = $backupSessionDir . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+        $dst = $backendRoot . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+        try {
+            assertTargetWritable($dst, $rel);
+            ensureParentDir($dst);
+            if (!copy($src, $dst)) {
+                throw new RuntimeException('copy 失败');
+            }
+            echo "OK  {$rel}\n";
+            $ok++;
+        } catch (Throwable $e) {
+            echo "FAIL {$rel} — {$e->getMessage()}\n";
+            $fail++;
+        }
+    }
+
+    if ($fail === 0) {
+        writeDeployedVersion($backendRoot, $targetVersion);
+    }
+
+    return ['ok' => $ok, 'fail' => $fail, 'targetVersion' => $targetVersion];
 }
 
 /**
@@ -545,11 +909,64 @@ function validateBackendRoot(string $backendRoot, array $patchFiles = []): array
 
 // --- main ---
 
+$listBackups = in_array('--list-backups', $argv ?? [], true);
+try {
+    $rollbackOption = resolveRollbackOption();
+} catch (Throwable $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
 $backendRoot = resolveBackendRoot();
 
 if (!is_dir($backendRoot)) {
     fwrite(STDERR, "Backend 根目录不存在: {$backendRoot}\n");
     exit(1);
+}
+
+if ($listBackups) {
+    $currentVersion = readDeployedVersion($backendRoot);
+    echo "BACKEND_ROOT: {$backendRoot}\n";
+    echo 'CURRENT_VERSION: ' . ($currentVersion ?? '(none)') . "\n";
+    echo "BACKUP_ROOT: " . resolveBackupRoot($backendRoot) . "\n\n";
+
+    $backups = listVersionBackups($backendRoot);
+    if ($backups === []) {
+        echo "暂无版本备份。\n";
+        exit(0);
+    }
+
+    foreach ($backups as $item) {
+        $version = $item['meta']['version'] ?? basename($item['dir']);
+        $replacedBy = $item['meta']['replaced_by'] ?? '-';
+        $backedUpAt = $item['meta']['backed_up_at'] ?? '-';
+        echo "- {$version}  文件:{$item['fileCount']}  升级至:{$replacedBy}  时间:{$backedUpAt}\n";
+        echo "  目录: {$item['dir']}\n";
+    }
+    exit(0);
+}
+
+if ($rollbackOption['enabled']) {
+    try {
+        $backupDir = resolveRollbackBackupDir($backendRoot, $rollbackOption['target']);
+    } catch (Throwable $e) {
+        fwrite(STDERR, $e->getMessage() . "\n");
+        exit(1);
+    }
+
+    echo "BACKEND_ROOT: {$backendRoot}\n";
+    echo "ROLLBACK_FROM_BACKUP: {$backupDir}\n";
+
+    $result = rollbackFromBackup($backendRoot, $backupDir);
+    if ($result['fail'] > 0) {
+        echo "\n回滚未完成: 成功 {$result['ok']}，失败 {$result['fail']}\n";
+        exit(1);
+    }
+
+    clearRuntimeCache($backendRoot);
+    tryThinkClear($backendRoot);
+    echo "\n已回滚至版本 {$result['targetVersion']}（成功 {$result['ok']} 个文件）\n";
+    exit(0);
 }
 
 $files = listPatchFiles();
@@ -574,6 +991,9 @@ if (!$rootCheck['valid']) {
 $dryRun = in_array('--check', $argv ?? [], true) || in_array('--dry-run', $argv ?? [], true);
 $noBackup = in_array('--no-backup', $argv ?? [], true);
 $backupEnabled = !$dryRun && !$noBackup;
+$patchDeployVersion = resolvePatchDeployVersion();
+$currentDeployedVersion = readDeployedVersion($backendRoot);
+$versionBackupEnabled = $backupEnabled && $patchDeployVersion !== null;
 
 $runUser = function_exists('posix_getpwuid')
     ? (posix_getpwuid(posix_geteuid())['name'] ?? 'unknown')
@@ -592,8 +1012,13 @@ if ($dryRun) {
 }
 if ($noBackup) {
     echo "BACKUP: disabled（--no-backup）\n";
+} elseif ($versionBackupEnabled) {
+    $backupLabel = $currentDeployedVersion ?? 'pre-deploy';
+    echo "BACKUP: version -> " . resolveBackupRoot($backendRoot) . '/' . formatBackupDirName($backupLabel) . "/\n";
+    echo "PATCH_VERSION: {$patchDeployVersion}\n";
+    echo 'CURRENT_VERSION: ' . ($currentDeployedVersion ?? '(none)') . "\n";
 } elseif ($backupEnabled) {
-    echo "BACKUP: enabled -> " . resolveBackupRoot($backendRoot) . "/<timestamp>/\n";
+    echo "BACKUP: timestamp -> " . resolveBackupRoot($backendRoot) . "/<timestamp>/\n";
 }
 
 try {
@@ -624,6 +1049,8 @@ $blocked = [];
 $backedUp = 0;
 /** @var string|null 本次部署备份会话目录 */
 $backupSessionDir = null;
+/** @var list<string> 已备份文件列表（用于 DEPLOY-META） */
+$backedUpFiles = [];
 
 foreach ($files as $rel) {
     $src = PATCH_ROOT . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
@@ -638,14 +1065,18 @@ foreach ($files as $rel) {
             continue;
         }
 
-        // 覆盖前先备份线上旧文件
+        // 覆盖前先备份线上旧文件（有 patch 版本标识时用版本目录）
         if ($backupEnabled && is_file($dst)) {
             if ($backupSessionDir === null) {
-                $backupSessionDir = createBackupSessionDir(resolveBackupRoot($backendRoot));
+                $backupRoot = resolveBackupRoot($backendRoot);
+                $backupSessionDir = $versionBackupEnabled
+                    ? createVersionBackupSessionDir($backupRoot, $currentDeployedVersion ?? 'pre-deploy')
+                    : createBackupSessionDir($backupRoot);
                 echo "BACKUP_DIR: {$backupSessionDir}\n";
             }
             if (backupExistingFile($dst, $rel, $backupSessionDir)) {
                 $backedUp++;
+                $backedUpFiles[] = $rel;
             }
         }
 
@@ -695,13 +1126,27 @@ if ($fail > 0) {
     exit(1);
 }
 
+if ($backupSessionDir !== null && $backedUpFiles !== [] && $versionBackupEnabled) {
+    $backupVersionLabel = $currentDeployedVersion ?? 'pre-deploy';
+    writeDeployMeta($backupSessionDir, $backupVersionLabel, $patchDeployVersion, $backedUpFiles);
+}
+
 clearRuntimeCache($backendRoot);
 tryThinkClear($backendRoot);
 
+if ($patchDeployVersion !== null) {
+    writeDeployedVersion($backendRoot, $patchDeployVersion);
+    echo "\nDEPLOY_VERSION: {$patchDeployVersion}\n";
+}
+
 if ($backupSessionDir !== null) {
-    $sampleRel = $files[0] ?? 'path/to/file.php';
+    $sampleRel = $backedUpFiles[0] ?? ($files[0] ?? 'path/to/file.php');
     echo "\n已备份 {$backedUp} 个旧文件至: {$backupSessionDir}\n";
-    echo "回滚示例: cp -f {$backupSessionDir}/{$sampleRel} {$backendRoot}/{$sampleRel}\n";
+    if ($versionBackupEnabled) {
+        echo "回滚示例: php apply-update.php --rollback " . escapeshellarg($backendRoot) . "\n";
+    } else {
+        echo "回滚示例: cp -f {$backupSessionDir}/{$sampleRel} {$backendRoot}/{$sampleRel}\n";
+    }
 }
 
 $deletedList = PATCH_ROOT . '/MANIFEST-deleted.txt';

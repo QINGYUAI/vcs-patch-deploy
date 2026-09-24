@@ -14,6 +14,12 @@ const { classifyDiffEntries, buildArtifactNames } = require('../lib/build-patch'
 const { readDeployMarker, writeDeployMarker } = require('../lib/marker')
 const { readManifestFiles } = require('../lib/manifest')
 const { readVersionsRegistry, registerVersion, writeJsonAtomic } = require('../lib/version-registry')
+const {
+  buildDeployVersionLabel,
+  archivePatchPackage,
+  readArchiveIndex
+} = require('../lib/version-archive')
+const { parseKeepVersions } = require('../lib/config')
 
 test('filterFilesBySelection 精确匹配与目录前缀', () => {
   const all = ['app/a.php', 'app/b.php', 'config/c.php']
@@ -105,6 +111,51 @@ test('validatePhpBackend 兼容 ThinkPHP 5 application/', () => {
   const result = validatePhpBackend(tmp)
   assert.equal(result.valid, true)
   assert.equal(result.framework, 'thinkphp')
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+test('buildDeployVersionLabel 支持 semver / r467 / git', () => {
+  assert.equal(buildDeployVersionLabel('svn', '467', '1.2.3'), '1.2.3')
+  assert.equal(buildDeployVersionLabel('svn', '467', null), 'r467')
+  assert.equal(buildDeployVersionLabel('git', 'abc123def4567890abcdef', null), 'abc123def456')
+})
+
+test('parseKeepVersions 默认与非法值回退', () => {
+  assert.equal(parseKeepVersions(undefined), 10)
+  assert.equal(parseKeepVersions('5'), 5)
+  assert.equal(parseKeepVersions('0'), 10)
+})
+
+test('archivePatchPackage 归档并保留最近 N 个版本', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'patch-archive-'))
+  const deployDir = path.join(tmp, 'deploy')
+
+  async function archiveRevision (rev, content) {
+    const patchDir = path.join(deployDir, 'out', `patch-r${rev}`)
+    fs.mkdirSync(path.join(patchDir, 'app'), { recursive: true })
+    fs.writeFileSync(path.join(patchDir, 'app', 'a.php'), content, 'utf8')
+    fs.writeFileSync(path.join(patchDir, 'VERSION.txt'), `version=r${rev}\n`, 'utf8')
+    await archivePatchPackage({
+      deployDir,
+      archiveLabel: `r${rev}`,
+      patchDir,
+      vcs: 'svn',
+      fromLabel: String(Number(rev) - 1),
+      toLabel: String(rev),
+      keepVersions: 2
+    })
+  }
+
+  await archiveRevision('1', 'v1')
+  await archiveRevision('2', 'v2')
+  await archiveRevision('3', 'v3')
+
+  const index = readArchiveIndex(deployDir)
+  assert.equal(index.versions.length, 2)
+  assert.equal(index.versions[0].label, 'r3')
+  assert.equal(index.versions[1].label, 'r2')
+  assert.ok(!fs.existsSync(path.join(deployDir, 'archive', 'r1')))
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })

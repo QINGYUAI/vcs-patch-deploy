@@ -36,6 +36,8 @@ ${chalk.yellow('选项:')}
   --version=<版本号>    安装版本号（如 1.2.3，写入 VERSION.txt 与 versions.json）
   --only=<文件>         仅打包指定文件（逗号分隔，可重复；支持 @files.txt）
   --file-list=<文件>    文件列表（每行一个相对路径）
+  --no-archive          跳过本地版本归档（deploy/archive/）
+  --keep-versions=<N>   本地 archive 保留版本数（默认 10）
   -h, --help            显示帮助
 
 ${chalk.yellow('环境变量:')}
@@ -46,6 +48,8 @@ ${chalk.yellow('环境变量:')}
   PATCH_ZIP_PREFIX      zip 前缀
   PATCH_VERSION         安装版本号
   PATCH_FILE_LIST       仅打包的文件列表路径
+  PATCH_NO_ARCHIVE      true 时跳过本地 archive
+  PATCH_KEEP_VERSIONS   本地 archive 保留版本数（默认 10）
 
 ${chalk.yellow('版本号 + 单独文件部署:')}
   patch-build --vcs=svn --version=1.2.3
@@ -88,6 +92,8 @@ function parseArgs () {
     else if (arg.startsWith('--version=')) opts.version = arg.split('=')[1]
     else if (arg.startsWith('--only=')) opts.onlyFiles.push(...arg.split('=')[1].split(','))
     else if (arg.startsWith('--file-list=')) opts.fileList = arg.split('=')[1]
+    else if (arg === '--no-archive') opts.noArchive = true
+    else if (arg.startsWith('--keep-versions=')) opts.keepVersions = arg.split('=')[1]
     else console.warn(chalk.yellow(`未知参数: ${arg}`))
   }
 
@@ -115,6 +121,8 @@ async function main () {
     version: opts.version,
     onlyFiles: opts.onlyFiles,
     fileList: opts.fileList,
+    noArchive: opts.noArchive,
+    keepVersions: opts.keepVersions,
     pkgRoot: path.join(__dirname, '..')
   })
 
@@ -139,6 +147,10 @@ async function main () {
     console.log(chalk.green(`  变更文件: ${result.fileCount}  删除: ${result.deletedCount}`))
     if (result.patchDir) console.log(chalk.green(`  patch 目录: ${result.patchDir}`))
     if (result.zipPath) console.log(chalk.green(`  zip: ${result.zipPath} (${result.zipSize} bytes)`))
+    if (result.archiveDir) console.log(chalk.green(`  归档: ${result.archiveDir}`))
+    if (result.deployVersionLabel) {
+      console.log(chalk.gray(`  部署版本标识: ${result.deployVersionLabel}`))
+    }
   }
 
   if (result.warnings?.length) {

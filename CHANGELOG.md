@@ -1,13 +1,20 @@
 # Changelog
 
+## 1.2.0
+
+### 新增
+
+- **版本备份（服务器）**：部署时按版本号备份至 `.deploy-backups/v1.2.2/` 或 `r467/`，写入 `.deploy-version`
+- **回滚与列表**：`apply-update.php --rollback` / `--list-backups`
+- **本地版本归档**：打包后自动归档至 `deploy/archive/`，默认保留 10 个版本（`--keep-versions` / `--no-archive`）
+- 所有 patch 包写入 `VERSION.txt`，revision 包自动使用 `r467` 标识
+
 ## 1.1.1
 
 ### 修复
 
 - `apply-update.php`：兼容 ThinkPHP 5（`application/`）及 patch 路径推断，不再强制要求 `app/`
 - `validatePhpBackend`：识别 `application/` 旧版目录结构
-
-## Unreleased
 
 ## 1.1.0
 

@@ -1,6 +1,6 @@
 {
   "name": "vcs-patch-deploy",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "PHP 后端（ThinkPHP）增量部署包生成工具 — 支持 SVN revision 与 Git commit 差异对比，打 zip 并附带 apply-update.php，供堡垒机/Web 终端上线",
   "main": "lib/index.js",
   "bin": {

@@ -1,6 +1,20 @@
 <?php
 declare(strict_types=1);
 
+// PHP 7.4 兼容：str_starts_with / str_ends_with 是 PHP 8.0 才内置的函数
+if (!function_exists('str_starts_with')) {
+    function str_starts_with(string $haystack, string $needle): bool
+    {
+        return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
+    }
+}
+if (!function_exists('str_ends_with')) {
+    function str_ends_with(string $haystack, string $needle): bool
+    {
+        return $needle === '' || substr($haystack, -strlen($needle)) === $needle;
+    }
+}
+
 /**
  * 堡垒机增量部署：将 patch 包内文件覆盖到线上 Backend 根目录，并清理 ThinkPHP 缓存。
  *
@@ -9,10 +23,16 @@ declare(strict_types=1);
  * 或设置环境变量：
  *   PATCH_BACKEND_ROOT=/path/to/production-api php apply-update.php
  *
- * 安全：不会覆盖 .env；不会自动删除 MANIFEST-deleted.txt 中列出的文件。
+ * 安全：不会覆盖 .env（含 .env.*）；不会自动删除 MANIFEST-deleted.txt 中列出的文件；
+ *       拒绝包内绝对路径、../ 逃逸路径与符号链接。
+ * 保护：包内 PROTECT.txt 列出的文件，线上已存在时跳过覆盖（不存在时仍写入）。
  * 备份：覆盖前将线上已有文件复制到版本备份目录（默认 Backend/.deploy-backups/v1.2.2/ 或 r467/）。
+ *       默认保留最近 10 个备份会话（--keep-backups=N / PATCH_KEEP_BACKUPS 调整）。
  * 回滚：php apply-update.php --rollback[=版本] <Backend根目录>
+ *       回滚会恢复被覆盖的旧文件（含权限），并删除本次部署新增且未被修改过的文件。
  * 列表：php apply-update.php --list-backups <Backend根目录>
+ *
+ * 要求 PHP >= 7.4。
  */
 
 /** patch 包根目录（本脚本所在目录） */
@@ -27,12 +47,17 @@ const DEPLOY_VERSION_FILE = '.deploy-version';
 /** 版本备份元数据文件名 */
 const DEPLOY_META_FILE = 'DEPLOY-META.txt';
 
+/** 备份会话标记文件（用于清理失败/无元数据的旧会话） */
+const BACKUP_SESSION_MARKER = '.deploy-backup-session';
+
 /** 部署时跳过的文件名（相对路径 basename 匹配或完整相对路径） */
 const SKIP_FILES = [
     'apply-update.php',
     'MANIFEST.txt',
     'MANIFEST-deleted.txt',
     'VERSION.txt',
+    'PROTECT.txt',
+    'MODES.txt',
 ];
 
 /** 永不覆盖的相对路径（保护生产配置与运行时数据） */
@@ -76,12 +101,15 @@ function resolveBackendRoot(): string
         if (str_starts_with($arg, '--rollback=')) {
             continue;
         }
+        if (str_starts_with($arg, '--keep-backups=')) {
+            continue;
+        }
         if ($arg !== '' && !str_starts_with($arg, '-')) {
             return rtrim($arg, "/\\");
         }
     }
 
-    fwrite(STDERR, "用法: php apply-update.php [--check] [--rollback[=版本]] [--list-backups] [--files=<路径>] <Backend根目录>\n");
+    fwrite(STDERR, "用法: php apply-update.php [--check] [--rollback[=版本]] [--list-backups] [--keep-backups=N] [--files=<路径>] <Backend根目录>\n");
     fwrite(STDERR, "示例: php apply-update.php /path/to/production-api\n");
     fwrite(STDERR, "      php apply-update.php --rollback /path/to/production-api\n");
     fwrite(STDERR, "      php apply-update.php --rollback=1.2.2 /path/to/production-api\n");
@@ -124,6 +152,354 @@ function sanitizeVersionLabel(string $version): string
     $label = preg_replace('/[^a-zA-Z0-9._-]/', '_', $label) ?? $label;
 
     return $label;
+}
+
+/**
+ * 判断包内相对路径是否安全（拒绝绝对路径、盘符、.. 逃逸与空字节）
+ */
+function isSafeRelativePath(string $rel): bool
+{
+    if ($rel === '' || strpos($rel, "\0") !== false) {
+        return false;
+    }
+
+    $normalized = str_replace('\\', '/', $rel);
+    if (str_starts_with($normalized, '/') || preg_match('#^[A-Za-z]:/#', $normalized) === 1) {
+        return false;
+    }
+
+    foreach (explode('/', $normalized) as $segment) {
+        if ($segment === '..') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * 永不覆盖的生产配置（根目录与任意目录下的 .env / .env.*）
+ */
+function isProtectedRelativePath(string $rel): bool
+{
+    $normalized = str_replace('\\', '/', $rel);
+    if (in_array($normalized, PROTECTED_RELATIVE, true)) {
+        return true;
+    }
+
+    $base = basename($normalized);
+
+    return $base === '.env' || str_starts_with($base, '.env.');
+}
+
+/**
+ * 读取包内 PROTECT.txt（每行一个相对路径，# 为注释）
+ *
+ * 受保护语义：线上已存在则跳过覆盖；线上不存在时仍写入（便于首次部署）。
+ *
+ * @return array<string, bool>
+ */
+function readProtectList(): array
+{
+    static $cache = null;
+    if (is_array($cache)) {
+        return $cache;
+    }
+
+    $cache = [];
+    $path = PATCH_ROOT . '/PROTECT.txt';
+    if (!is_file($path)) {
+        return $cache;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return $cache;
+    }
+
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+        $rel = str_replace('\\', '/', $trimmed);
+        if (!isSafeRelativePath($rel)) {
+            fwrite(STDERR, "忽略 PROTECT.txt 中的不安全路径: {$rel}\n");
+            continue;
+        }
+        $cache[$rel] = true;
+    }
+
+    return $cache;
+}
+
+/**
+ * 是否在包内保护清单中
+ */
+function isProtectListed(string $rel): bool
+{
+    $list = readProtectList();
+
+    return isset($list[str_replace('\\', '/', $rel)]);
+}
+
+/**
+ * exec 是否可用（disable_functions 可能在堡垒机环境禁用）
+ */
+function isExecAvailable(): bool
+{
+    if (!function_exists('exec')) {
+        return false;
+    }
+
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+
+    return !in_array('exec', $disabled, true);
+}
+
+/**
+ * 读取包内 MODES.txt（可执行文件清单）
+ *
+ * @return array<string, int> 相对路径 -> 权限（如 0755）
+ */
+function readModesList(): array
+{
+    static $cache = null;
+    if (is_array($cache)) {
+        return $cache;
+    }
+
+    $cache = [];
+    $path = PATCH_ROOT . '/MODES.txt';
+    if (!is_file($path)) {
+        return $cache;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return $cache;
+    }
+
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+        if (preg_match('/^([0-7]{3,4})\s+(.+)$/', $trimmed, $m) !== 1) {
+            continue;
+        }
+        $rel = str_replace('\\', '/', trim($m[2]));
+        if (!isSafeRelativePath($rel)) {
+            continue;
+        }
+        $cache[$rel] = octdec($m[1]);
+    }
+
+    return $cache;
+}
+
+/**
+ * 规范化路径用于比较（Windows 不区分大小写）
+ */
+function normalizeComparablePath(string $path): string
+{
+    $norm = str_replace('\\', '/', rtrim($path, "/\\"));
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $norm = strtolower($norm);
+    }
+
+    return $norm;
+}
+
+/**
+ * 判断路径是否位于某个目录之下
+ */
+function isPathInside(string $child, string $parent): bool
+{
+    $c = normalizeComparablePath($child);
+    $p = normalizeComparablePath($parent);
+
+    return $c === $p || str_starts_with($c . '/', $p . '/');
+}
+
+/**
+ * 覆盖前校验目标路径：
+ *   - 目标本身不能是符号链接（避免写到链接指向的任意文件）
+ *   - 最近的已存在父目录 realpath 必须仍在 Backend 根内（避免父目录软链逃逸）
+ */
+function assertTargetInsideBackend(string $backendRoot, string $dst, string $rel): void
+{
+    if (is_link($dst)) {
+        throw new RuntimeException('目标是符号链接（拒绝覆盖）');
+    }
+
+    $rootReal = realpath($backendRoot);
+    if ($rootReal === false) {
+        return;
+    }
+
+    $probe = dirname($dst);
+    while (!is_dir($probe) && dirname($probe) !== $probe) {
+        $probe = dirname($probe);
+    }
+
+    $probeReal = realpath($probe);
+    if ($probeReal === false) {
+        throw new RuntimeException('无法解析目标父目录');
+    }
+
+    if (!isPathInside($probeReal, $rootReal)) {
+        throw new RuntimeException("目标路径越出 Backend 根目录（疑似符号链接）: {$rel}");
+    }
+}
+
+/**
+ * 备份会话保留数量（--keep-backups=N / PATCH_KEEP_BACKUPS，默认 10）
+ */
+function resolveKeepBackups(): int
+{
+    global $argv;
+
+    foreach ($argv ?? [] as $arg) {
+        if (str_starts_with($arg, '--keep-backups=')) {
+            $n = (int) substr($arg, strlen('--keep-backups='));
+            return $n > 0 ? $n : 10;
+        }
+    }
+
+    $fromEnv = getenv('PATCH_KEEP_BACKUPS');
+    if (is_string($fromEnv) && preg_match('/^\d+$/', $fromEnv) === 1) {
+        $n = (int) $fromEnv;
+        return $n > 0 ? $n : 10;
+    }
+
+    return 10;
+}
+
+/**
+ * 递归删除目录（仅用于清理旧备份会话）
+ */
+function removeDirectoryTree(string $dir): bool
+{
+    if (!is_dir($dir)) {
+        return true;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        $path = $item->getPathname();
+        if ($item->isDir() && !$item->isLink()) {
+            @rmdir($path);
+        } else {
+            @unlink($path);
+        }
+    }
+
+    return @rmdir($dir);
+}
+
+/**
+ * 清理超出保留数量的备份会话（含 DEPLOY-META.txt 或本工具写入的会话标记）
+ *
+ * @param string|null $excludeDir 当前部署刚创建的会话（始终保留）
+ * @return list<string> 被删除的会话名
+ */
+function pruneBackupSessions(string $backendRoot, int $keep, ?string $excludeDir = null): array
+{
+    $backupRoot = resolveBackupRoot($backendRoot);
+    if (!is_dir($backupRoot)) {
+        return [];
+    }
+
+    /** @var list<array{dir: string, mtime: int}> $sessions */
+    $sessions = [];
+    /** @var list<array{dir: string, mtime: int}> $incomplete */
+    $incomplete = [];
+    foreach (scandir($backupRoot) ?: [] as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+        $dir = $backupRoot . '/' . $name;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        if ($excludeDir !== null && normalizeComparablePath($dir) === normalizeComparablePath($excludeDir)) {
+            continue;
+        }
+
+        $item = ['dir' => $dir, 'mtime' => (int) @filemtime($dir)];
+        if (is_file($dir . '/' . DEPLOY_META_FILE)) {
+            $sessions[] = $item;
+        } elseif (is_file($dir . '/' . BACKUP_SESSION_MARKER)) {
+            // 中断/旧包的会话：没有元数据，不计入保留数量，单独按时间清理
+            $incomplete[] = $item;
+        }
+    }
+
+    usort($sessions, static function (array $a, array $b): int {
+        $timeA = readDeployMeta($a['dir'])['backed_up_at'] ?? '';
+        $timeB = readDeployMeta($b['dir'])['backed_up_at'] ?? '';
+        if ($timeA !== $timeB) {
+            return $timeA < $timeB ? 1 : -1;
+        }
+        if ($a['mtime'] !== $b['mtime']) {
+            return $b['mtime'] <=> $a['mtime'];
+        }
+        return strcmp(basename($b['dir']), basename($a['dir']));
+    });
+
+    // 保留数量包含当前会话
+    $keepOthers = max(0, max(1, $keep) - ($excludeDir !== null ? 1 : 0));
+    /** @var list<string> $removed */
+    $removed = [];
+    foreach (array_slice($sessions, $keepOthers) as $item) {
+        if (removeDirectoryTree($item['dir'])) {
+            $removed[] = basename($item['dir']);
+        }
+    }
+
+    // 中断会话最多保留 5 个，且只保留最近 24 小时
+    $cutoff = time() - 86400;
+    usort($incomplete, static function (array $a, array $b): int {
+        return $b['mtime'] <=> $a['mtime'];
+    });
+    foreach ($incomplete as $index => $item) {
+        if ($index < 5 && $item['mtime'] >= $cutoff) {
+            continue;
+        }
+        if (removeDirectoryTree($item['dir'])) {
+            $removed[] = basename($item['dir']);
+        }
+    }
+
+    return $removed;
+}
+
+/**
+ * 备份目录位于站点根内时，尽量阻止 Web 直接访问（Apache；nginx 需在配置中 deny）
+ */
+function protectBackupDir(string $backupRoot): void
+{
+    if (!is_dir($backupRoot) && !mkdir($backupRoot, 0755, true) && !is_dir($backupRoot)) {
+        return;
+    }
+
+    $htaccess = $backupRoot . '/.htaccess';
+    if (!is_file($htaccess)) {
+        @file_put_contents(
+            $htaccess,
+            "# 备份包含历史源码，禁止 Web 访问\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Deny from all\n</IfModule>\n"
+        );
+    }
+
+    $index = $backupRoot . '/index.html';
+    if (!is_file($index)) {
+        @file_put_contents($index, "Forbidden\n");
+    }
 }
 
 /**
@@ -251,19 +627,27 @@ function createVersionBackupSessionDir(string $backupRoot, ?string $currentVersi
         throw new RuntimeException("无法创建版本备份目录: {$sessionDir}");
     }
 
+    markBackupSession($sessionDir);
+
     return $sessionDir;
 }
 
 /**
  * 写入版本备份元数据
  *
- * @param list<string> $backedUpFiles
+ * @param list<string> $backedUpFiles 本次被覆盖的旧文件（已备份到本目录）
+ * @param list<array{hash: string, rel: string}> $createdFiles 本次新增的文件（回滚时删除）
+ * @param array<string, int> $modes 被覆盖文件的原始权限（回滚时恢复）
+ * @param bool $partial 是否来自部分部署（子集包）
  */
 function writeDeployMeta(
     string $backupSessionDir,
     string $versionLabel,
     ?string $replacedBy,
-    array $backedUpFiles
+    array $backedUpFiles,
+    array $createdFiles = [],
+    array $modes = [],
+    bool $partial = false
 ): void {
     $lines = [
         'version=' . sanitizeVersionLabel($versionLabel),
@@ -274,13 +658,109 @@ function writeDeployMeta(
     if ($replacedBy !== null && $replacedBy !== '') {
         $lines[] = 'replaced_by=' . sanitizeVersionLabel($replacedBy);
     }
+    if ($partial) {
+        $lines[] = 'partial=1';
+    }
     $lines[] = '';
     $lines[] = '# files';
     foreach ($backedUpFiles as $rel) {
         $lines[] = $rel;
     }
 
+    if ($modes !== []) {
+        $lines[] = '';
+        $lines[] = '# modes';
+        foreach ($modes as $rel => $mode) {
+            $lines[] = sprintf('%04o  %s', $mode, $rel);
+        }
+    }
+
+    if ($createdFiles !== []) {
+        $lines[] = '';
+        $lines[] = '# created';
+        foreach ($createdFiles as $item) {
+            $lines[] = $item['hash'] . '  ' . $item['rel'];
+        }
+    }
+
     file_put_contents($backupSessionDir . '/' . DEPLOY_META_FILE, implode("\n", $lines) . "\n");
+}
+
+/**
+ * 读取 DEPLOY-META 中的 # modes 段（回滚恢复权限）
+ *
+ * @return array<string, int>
+ */
+function readMetaModes(string $backupSessionDir): array
+{
+    $path = $backupSessionDir . '/' . DEPLOY_META_FILE;
+    if (!is_file($path)) {
+        return [];
+    }
+
+    /** @var array<string, int> $modes */
+    $modes = [];
+    $inModes = false;
+
+    foreach (file($path, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '# modes') {
+            $inModes = true;
+            continue;
+        }
+        if ($inModes && str_starts_with($trimmed, '#')) {
+            break;
+        }
+        if ($inModes && preg_match('/^([0-7]{3,4})\s+(.+)$/', $trimmed, $m) === 1) {
+            $rel = str_replace('\\', '/', trim($m[2]));
+            if (isSafeRelativePath($rel)) {
+                $modes[$rel] = octdec($m[1]);
+            }
+        }
+    }
+
+    return $modes;
+}
+
+/**
+ * 读取元数据中本次部署新增的文件（用于回滚时删除）
+ *
+ * @return list<array{hash: string, rel: string}>
+ */
+function readMetaCreatedFiles(string $backupSessionDir): array
+{
+    $metaPath = $backupSessionDir . '/' . DEPLOY_META_FILE;
+    if (!is_file($metaPath)) {
+        return [];
+    }
+
+    $lines = file($metaPath, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return [];
+    }
+
+    /** @var list<array{hash: string, rel: string}> $items */
+    $items = [];
+    $inCreated = false;
+
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '# created') {
+            $inCreated = true;
+            continue;
+        }
+        if ($inCreated && str_starts_with($trimmed, '#')) {
+            break;
+        }
+        if ($inCreated && $trimmed !== '' && preg_match('/^([0-9a-f]{64})\s+(.+)$/i', $trimmed, $m) === 1) {
+            $rel = str_replace('\\', '/', trim($m[2]));
+            if (isSafeRelativePath($rel)) {
+                $items[] = ['hash' => strtolower($m[1]), 'rel' => $rel];
+            }
+        }
+    }
+
+    return $items;
 }
 
 /**
@@ -317,7 +797,7 @@ function listBackupFiles(string $backupSessionDir): array
         $abs = $fileInfo->getPathname();
         $rel = substr($abs, strlen($backupSessionDir) + 1);
         $relNorm = str_replace('\\', '/', $rel);
-        if (in_array(basename($relNorm), [DEPLOY_META_FILE, 'MANIFEST.txt'], true)) {
+        if (in_array(basename($relNorm), [DEPLOY_META_FILE, BACKUP_SESSION_MARKER, 'MANIFEST.txt'], true)) {
             continue;
         }
         $files[] = $relNorm;
@@ -351,6 +831,10 @@ function listVersionBackups(string $backendRoot): array
             continue;
         }
         $meta = readDeployMeta($dir);
+        // 没有元数据的中断会话不列入可回滚版本（仍会被保留策略清理）
+        if ($meta === []) {
+            continue;
+        }
         $items[] = [
             'dir' => $dir,
             'meta' => $meta,
@@ -361,7 +845,16 @@ function listVersionBackups(string $backendRoot): array
     usort($items, static function (array $a, array $b): int {
         $timeA = $a['meta']['backed_up_at'] ?? '';
         $timeB = $b['meta']['backed_up_at'] ?? '';
-        return $timeA < $timeB ? 1 : -1;
+        if ($timeA !== $timeB) {
+            return $timeA < $timeB ? 1 : -1;
+        }
+        $mA = (int) @filemtime($a['dir']);
+        $mB = (int) @filemtime($b['dir']);
+        if ($mA !== $mB) {
+            return $mB <=> $mA;
+        }
+        // 同秒部署：带 _时间戳 后缀的会话更新，排在基础目录之前
+        return strcmp(basename($b['dir']), basename($a['dir']));
     });
 
     return $items;
@@ -377,6 +870,15 @@ function resolveRollbackBackupDir(string $backendRoot, ?string $targetVersion): 
 
     if ($targetVersion !== null && $targetVersion !== '') {
         $targetLabel = sanitizeVersionLabel($targetVersion);
+
+        // 同一版本可能重复部署（目录会追加 _时间戳），取最近一次会话
+        foreach (listVersionBackups($backendRoot) as $item) {
+            $metaVersion = sanitizeVersionLabel($item['meta']['version'] ?? '');
+            if ($metaVersion === $targetLabel) {
+                return $item['dir'];
+            }
+        }
+
         $candidate = $backupRoot . '/' . formatBackupDirName($targetLabel);
         if (!is_dir($candidate)) {
             throw new RuntimeException("未找到版本 {$targetLabel} 的备份目录: {$candidate}");
@@ -401,7 +903,9 @@ function resolveRollbackBackupDir(string $backendRoot, ?string $targetVersion): 
 /**
  * 从版本备份恢复文件
  *
- * @return array{ok: int, fail: int, targetVersion: string}
+ * 恢复备份的旧文件；并删除本次部署新增的文件（仅当内容未被修改过）。
+ *
+ * @return array{ok: int, fail: int, removed: int, kept: int, targetVersion: string}
  */
 function rollbackFromBackup(string $backendRoot, string $backupSessionDir): array
 {
@@ -409,8 +913,14 @@ function rollbackFromBackup(string $backendRoot, string $backupSessionDir): arra
     $targetVersion = $meta['version'] ?? basename($backupSessionDir);
     $targetVersion = sanitizeVersionLabel($targetVersion);
 
+    if (($meta['partial'] ?? '') === '1') {
+        echo "注意: 该备份来自部分部署（子集包），只会恢复其中的文件。\n";
+    }
+
     $files = listBackupFiles($backupSessionDir);
-    if ($files === []) {
+    $createdFiles = readMetaCreatedFiles($backupSessionDir);
+    $modes = readMetaModes($backupSessionDir);
+    if ($files === [] && $createdFiles === []) {
         throw new RuntimeException("备份目录无可用文件: {$backupSessionDir}");
     }
 
@@ -420,10 +930,14 @@ function rollbackFromBackup(string $backendRoot, string $backupSessionDir): arra
         $src = $backupSessionDir . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
         $dst = $backendRoot . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
         try {
+            assertTargetInsideBackend($backendRoot, $dst, $rel);
             assertTargetWritable($dst, $rel);
             ensureParentDir($dst);
             if (!copy($src, $dst)) {
                 throw new RuntimeException('copy 失败');
+            }
+            if (isset($modes[$rel])) {
+                @chmod($dst, $modes[$rel]);
             }
             echo "OK  {$rel}\n";
             $ok++;
@@ -433,11 +947,50 @@ function rollbackFromBackup(string $backendRoot, string $backupSessionDir): arra
         }
     }
 
+    // 删除本次部署新增的文件；内容已变化则保留现场，避免误删后续改动
+    $removed = 0;
+    $kept = 0;
+    foreach ($createdFiles as $item) {
+        $rel = $item['rel'];
+        if (isProtectedRelativePath($rel) || isProtectListed($rel)) {
+            echo "SKIP {$rel} — 受保护路径\n";
+            $kept++;
+            continue;
+        }
+
+        $dst = $backendRoot . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+        if (!is_file($dst)) {
+            echo "SKIP {$rel} — 已不存在\n";
+            continue;
+        }
+
+        $currentHash = @hash_file('sha256', $dst);
+        if (!is_string($currentHash) || !hash_equals($item['hash'], $currentHash)) {
+            echo "SKIP {$rel} — 部署后已被修改，保留\n";
+            $kept++;
+            continue;
+        }
+
+        if (@unlink($dst)) {
+            echo "DELETED {$rel}\n";
+            $removed++;
+        } else {
+            echo "FAIL-DELETE {$rel} — 无法删除\n";
+            $fail++;
+        }
+    }
+
     if ($fail === 0) {
         writeDeployedVersion($backendRoot, $targetVersion);
     }
 
-    return ['ok' => $ok, 'fail' => $fail, 'targetVersion' => $targetVersion];
+    return [
+        'ok' => $ok,
+        'fail' => $fail,
+        'removed' => $removed,
+        'kept' => $kept,
+        'targetVersion' => $targetVersion,
+    ];
 }
 
 /**
@@ -488,11 +1041,17 @@ function listPatchFiles(): array
         /** @var list<string> $files */
         $files = [];
         foreach ($fromManifest as $rel) {
+            if (!isSafeRelativePath($rel)) {
+                throw new RuntimeException("MANIFEST.txt 含不安全路径（拒绝部署）: {$rel}");
+            }
             $abs = PATCH_ROOT . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
             if (!is_file($abs)) {
                 continue;
             }
-            if (in_array($rel, PROTECTED_RELATIVE, true)) {
+            if (is_link($abs)) {
+                throw new RuntimeException("patch 包内含符号链接（拒绝部署）: {$rel}");
+            }
+            if (isProtectedRelativePath($rel)) {
                 continue;
             }
             $files[] = $rel;
@@ -515,13 +1074,20 @@ function listPatchFiles(): array
         $rel = substr($abs, strlen(PATCH_ROOT) + 1);
         $relNorm = str_replace('\\', '/', $rel);
 
+        if (!isSafeRelativePath($relNorm)) {
+            throw new RuntimeException("patch 包内含不安全路径（拒绝部署）: {$relNorm}");
+        }
+        if ($fileInfo->isLink()) {
+            throw new RuntimeException("patch 包内含符号链接（拒绝部署）: {$relNorm}");
+        }
+
         if (in_array(basename($relNorm), SKIP_FILES, true)) {
             continue;
         }
         if (in_array($relNorm, SKIP_FILES, true)) {
             continue;
         }
-        if (in_array($relNorm, PROTECTED_RELATIVE, true)) {
+        if (isProtectedRelativePath($relNorm)) {
             continue;
         }
 
@@ -542,6 +1108,20 @@ function listPatchFiles(): array
     sort($files);
 
     return $files;
+}
+
+/**
+ * 输出 MANIFEST-deleted.txt 提示（不自动删除线上文件）
+ */
+function printDeletedNotice(): void
+{
+    $deletedList = PATCH_ROOT . '/MANIFEST-deleted.txt';
+    if (!is_file($deletedList)) {
+        return;
+    }
+
+    echo "\n注意: 存在 MANIFEST-deleted.txt，未自动删除线上文件，请人工确认:\n";
+    echo file_get_contents($deletedList);
 }
 
 /**
@@ -641,6 +1221,9 @@ function detectPhpBinary(): string
 {
     if (defined('PHP_BINARY') && PHP_BINARY !== '') {
         return PHP_BINARY;
+    }
+    if (!function_exists('shell_exec')) {
+        return 'php';
     }
     $which = trim((string) shell_exec('command -v php 2>/dev/null'));
     if ($which !== '') {
@@ -754,7 +1337,20 @@ function createBackupSessionDir(string $backupRoot): string
         throw new RuntimeException("无法创建备份目录: {$sessionDir}");
     }
 
+    markBackupSession($sessionDir);
+
     return $sessionDir;
+}
+
+/**
+ * 标记本工具创建的备份会话（即使部署中断、没有 DEPLOY-META 也能被保留策略清理）
+ */
+function markBackupSession(string $sessionDir): void
+{
+    @file_put_contents(
+        $sessionDir . '/' . BACKUP_SESSION_MARKER,
+        "session=1\ncreated_at=" . date('Y-m-d H:i:s') . "\n"
+    );
 }
 
 /**
@@ -821,6 +1417,11 @@ function tryThinkClear(string $backendRoot): void
 {
     $think = $backendRoot . '/think';
     if (!is_file($think)) {
+        return;
+    }
+
+    if (!isExecAvailable()) {
+        echo "提示: exec 被 disable_functions 禁用，跳过 php think clear（已清理 runtime/cache）\n";
         return;
     }
 
@@ -965,13 +1566,24 @@ if ($rollbackOption['enabled']) {
 
     clearRuntimeCache($backendRoot);
     tryThinkClear($backendRoot);
-    echo "\n已回滚至版本 {$result['targetVersion']}（成功 {$result['ok']} 个文件）\n";
+    echo "\n已回滚至版本 {$result['targetVersion']}（恢复 {$result['ok']} 个文件，删除 {$result['removed']} 个新增文件）\n";
+    if ($result['kept'] > 0) {
+        echo "保留 {$result['kept']} 个新增文件（部署后已修改或受保护）\n";
+    }
     exit(0);
 }
 
-$files = listPatchFiles();
+try {
+    $files = listPatchFiles();
+} catch (Throwable $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
 if ($files === []) {
     echo "patch 包内无待部署文件。\n";
+    // 仅含删除项的包没有可部署文件，但仍需提示人工删除
+    printDeletedNotice();
     exit(0);
 }
 
@@ -994,6 +1606,8 @@ $backupEnabled = !$dryRun && !$noBackup;
 $patchDeployVersion = resolvePatchDeployVersion();
 $currentDeployedVersion = readDeployedVersion($backendRoot);
 $versionBackupEnabled = $backupEnabled && $patchDeployVersion !== null;
+$patchMeta = readKeyValueFile(PATCH_ROOT . '/VERSION.txt');
+$isPartialDeploy = ($patchMeta['partial'] ?? '') === '1';
 
 $runUser = function_exists('posix_getpwuid')
     ? (posix_getpwuid(posix_geteuid())['name'] ?? 'unknown')
@@ -1007,18 +1621,33 @@ if ($rootCheck['markers'] !== []) {
 }
 echo "\n";
 echo "RUN_AS: {$runUser}\n";
+if (readProtectList() !== []) {
+    echo 'PROTECT: ' . count(readProtectList()) . " 个文件（线上已存在则跳过覆盖）\n";
+}
 if ($dryRun) {
     echo "MODE: check-only（不写入文件）\n";
+}
+if ($isPartialDeploy) {
+    echo "PATCH_MODE: partial（子集包，回滚只覆盖其中的文件）\n";
 }
 if ($noBackup) {
     echo "BACKUP: disabled（--no-backup）\n";
 } elseif ($versionBackupEnabled) {
     $backupLabel = $currentDeployedVersion ?? 'pre-deploy';
-    echo "BACKUP: version -> " . resolveBackupRoot($backendRoot) . '/' . formatBackupDirName($backupLabel) . "/\n";
+    echo "BACKUP: 按当前版本 {$backupLabel} 建立备份会话（重复部署追加时间戳）\n";
     echo "PATCH_VERSION: {$patchDeployVersion}\n";
     echo 'CURRENT_VERSION: ' . ($currentDeployedVersion ?? '(none)') . "\n";
 } elseif ($backupEnabled) {
     echo "BACKUP: timestamp -> " . resolveBackupRoot($backendRoot) . "/<timestamp>/\n";
+}
+
+if ($backupEnabled) {
+    $backupRootForCheck = resolveBackupRoot($backendRoot);
+    if (isPathInside($backupRootForCheck, $backendRoot)) {
+        echo "WARN: 备份目录位于 Backend 根内（{$backupRootForCheck}），历史源码可能被 Web 访问；\n";
+        echo "      建议将 PATCH_BACKUP_DIR 指向站点根外，或在 Web 配置中禁止访问该目录\n";
+        protectBackupDir($backupRootForCheck);
+    }
 }
 
 try {
@@ -1040,23 +1669,42 @@ if ($fileFilter !== null) {
 
 if ($files === []) {
     echo "筛选后无待部署文件。\n";
+    printDeletedNotice();
     exit(0);
 }
 
 $ok = 0;
 $fail = 0;
+$protectedSkipped = 0;
 $blocked = [];
 $backedUp = 0;
+$modesList = readModesList();
+/** @var array<string, int> 被覆盖文件的原始权限（回滚时恢复） */
+$backedUpModes = [];
 /** @var string|null 本次部署备份会话目录 */
 $backupSessionDir = null;
 /** @var list<string> 已备份文件列表（用于 DEPLOY-META） */
 $backedUpFiles = [];
+/** @var list<array{hash: string, rel: string}> 本次新增文件（用于回滚删除） */
+$createdFiles = [];
 
 foreach ($files as $rel) {
     $src = PATCH_ROOT . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
     $dst = $backendRoot . '/' . str_replace('/', DIRECTORY_SEPARATOR, $rel);
 
     try {
+        if (!isSafeRelativePath($rel)) {
+            throw new RuntimeException('路径不安全');
+        }
+
+        // 受保护文件：线上已存在则不覆盖（保留运行时被程序改写的内容）
+        if (isProtectListed($rel) && is_file($dst)) {
+            echo "SKIP {$rel} — 受保护文件（线上已存在，未覆盖）\n";
+            $protectedSkipped++;
+            continue;
+        }
+
+        assertTargetInsideBackend($backendRoot, $dst, $rel);
         assertTargetWritable($dst, $rel);
         if ($dryRun) {
             $existsHint = is_file($dst) ? '，线上已有文件' : '';
@@ -1065,14 +1713,22 @@ foreach ($files as $rel) {
             continue;
         }
 
-        // 覆盖前先备份线上旧文件（有 patch 版本标识时用版本目录）
-        if ($backupEnabled && is_file($dst)) {
-            if ($backupSessionDir === null) {
-                $backupRoot = resolveBackupRoot($backendRoot);
-                $backupSessionDir = $versionBackupEnabled
-                    ? createVersionBackupSessionDir($backupRoot, $currentDeployedVersion ?? 'pre-deploy')
-                    : createBackupSessionDir($backupRoot);
-                echo "BACKUP_DIR: {$backupSessionDir}\n";
+        $isNewFile = !is_file($dst);
+
+        // 本次部署的备份会话（覆盖旧文件或新增文件都需要，便于回滚时删除新增文件）
+        if ($backupEnabled && $backupSessionDir === null) {
+            $backupRoot = resolveBackupRoot($backendRoot);
+            $backupSessionDir = $versionBackupEnabled
+                ? createVersionBackupSessionDir($backupRoot, $currentDeployedVersion ?? 'pre-deploy')
+                : createBackupSessionDir($backupRoot);
+            echo "BACKUP_DIR: {$backupSessionDir}\n";
+        }
+
+        // 覆盖前先备份线上旧文件（有 patch 版本标识时用版本目录），并记录原权限
+        if ($backupEnabled && !$isNewFile) {
+            $origMode = @fileperms($dst);
+            if ($origMode !== false) {
+                $backedUpModes[$rel] = $origMode & 0777;
             }
             if (backupExistingFile($dst, $rel, $backupSessionDir)) {
                 $backedUp++;
@@ -1083,6 +1739,15 @@ foreach ($files as $rel) {
         ensureParentDir($dst);
         if (!copy($src, $dst)) {
             throw new RuntimeException('copy 失败');
+        }
+        if (isset($modesList[$rel]) && !@chmod($dst, $modesList[$rel])) {
+            echo "WARN {$rel} — 无法设置权限 0" . decoct($modesList[$rel]) . "\n";
+        }
+        if ($isNewFile) {
+            $hash = @hash_file('sha256', $dst);
+            if (is_string($hash)) {
+                $createdFiles[] = ['hash' => $hash, 'rel' => $rel];
+            }
         }
         echo "OK  {$rel}\n";
         $ok++;
@@ -1116,19 +1781,39 @@ if ($fail > 0) {
 }
 
 if ($dryRun) {
-    echo "\n检查完成: 可写 {$ok}，不可写 {$fail}\n";
+    echo "\n检查完成: 可写 {$ok}，不可写 {$fail}";
+    if ($protectedSkipped > 0) {
+        echo "，跳过 {$protectedSkipped}（受保护）";
+    }
+    echo "\n";
+    printDeletedNotice();
     exit($fail > 0 ? 1 : 0);
 }
 
 if ($fail > 0) {
     echo "\n存在写入失败，已跳过清缓存（避免未更新代码却刷新缓存）。\n";
-    echo "完成: 成功 {$ok}，失败 {$fail}\n";
+    echo "完成: 成功 {$ok}，失败 {$fail}";
+    if ($protectedSkipped > 0) {
+        echo "，跳过 {$protectedSkipped}（受保护）";
+    }
+    echo "\n";
     exit(1);
 }
 
-if ($backupSessionDir !== null && $backedUpFiles !== [] && $versionBackupEnabled) {
+if (
+    $backupSessionDir !== null
+    && $backupEnabled
+) {
     $backupVersionLabel = $currentDeployedVersion ?? 'pre-deploy';
-    writeDeployMeta($backupSessionDir, $backupVersionLabel, $patchDeployVersion, $backedUpFiles);
+    writeDeployMeta(
+        $backupSessionDir,
+        $backupVersionLabel,
+        $patchDeployVersion,
+        $backedUpFiles,
+        $createdFiles,
+        $backedUpModes,
+        $isPartialDeploy
+    );
 }
 
 clearRuntimeCache($backendRoot);
@@ -1137,6 +1822,16 @@ tryThinkClear($backendRoot);
 if ($patchDeployVersion !== null) {
     writeDeployedVersion($backendRoot, $patchDeployVersion);
     echo "\nDEPLOY_VERSION: {$patchDeployVersion}\n";
+}
+
+// 备份会话保留策略（默认 10 个），避免 .deploy-backups 无限增长
+if ($backupEnabled && $backupSessionDir !== null) {
+    $keepBackups = resolveKeepBackups();
+    $prunedSessions = pruneBackupSessions($backendRoot, $keepBackups, $backupSessionDir);
+    if ($prunedSessions !== []) {
+        echo "\n已清理旧备份会话 " . count($prunedSessions) . " 个（保留最近 {$keepBackups} 个）\n";
+        echo '  删除: ' . implode(', ', $prunedSessions) . "\n";
+    }
 }
 
 if ($backupSessionDir !== null) {
@@ -1149,11 +1844,11 @@ if ($backupSessionDir !== null) {
     }
 }
 
-$deletedList = PATCH_ROOT . '/MANIFEST-deleted.txt';
-if (is_file($deletedList)) {
-    echo "\n注意: 存在 MANIFEST-deleted.txt，未自动删除线上文件，请人工确认:\n";
-    echo file_get_contents($deletedList);
-}
+printDeletedNotice();
 
-echo "\n完成: 成功 {$ok}，失败 {$fail}\n";
+echo "\n完成: 成功 {$ok}，失败 {$fail}";
+if ($protectedSkipped > 0) {
+    echo "，跳过 {$protectedSkipped}（受保护）";
+}
+echo "\n";
 exit($fail > 0 ? 1 : 0);

@@ -32,6 +32,9 @@ ${chalk.yellow('选项:')}
   --only=<路径>         要提取的文件（逗号分隔，可重复；支持 @files.txt）
   --file-list=<文件>    每行一个相对路径的列表文件
   --deploy=<目录>       deploy 目录
+  --apply-script=<文件> 使用自定义 apply-update.php 模板
+  --protect=<路径>      追加受保护文件（逗号分隔，可重复）
+  --protect-file=<文件> 追加受保护文件列表
   --no-zip              仅生成 patch 目录
   --register            将子集包写入 versions.json
   --list-versions       列出已注册版本
@@ -51,19 +54,26 @@ ${chalk.yellow('示例:')}
 
 function parseArgs () {
   const args = process.argv.slice(2)
-  const opts = { showHelp: false, onlyFiles: [] }
+  const opts = { showHelp: false, onlyFiles: [], protectFiles: [] }
 
   for (const arg of args) {
     if (arg === '--help' || arg === '-h') opts.showHelp = true
     else if (arg === '--no-zip') opts.noZip = true
     else if (arg === '--register') opts.register = true
     else if (arg === '--list-versions') opts.listVersions = true
-    else if (arg.startsWith('--version=')) opts.version = arg.split('=')[1]
-    else if (arg.startsWith('--from-patch=')) opts.fromPatch = arg.split('=')[1]
-    else if (arg.startsWith('--only=')) opts.onlyFiles.push(...arg.split('=')[1].split(','))
-    else if (arg.startsWith('--file-list=')) opts.fileList = arg.split('=')[1]
-    else if (arg.startsWith('--deploy=')) opts.deployDir = arg.split('=')[1]
-    else console.warn(chalk.yellow(`未知参数: ${arg}`))
+    else if (arg.startsWith('--version=')) opts.version = arg.slice(arg.indexOf('=') + 1)
+    else if (arg.startsWith('--from-patch=')) opts.fromPatch = arg.slice(arg.indexOf('=') + 1)
+    else if (arg.startsWith('--only=')) opts.onlyFiles.push(...arg.slice(arg.indexOf('=') + 1).split(','))
+    else if (arg.startsWith('--file-list=')) opts.fileList = arg.slice(arg.indexOf('=') + 1)
+    else if (arg.startsWith('--deploy=')) opts.deployDir = arg.slice(arg.indexOf('=') + 1)
+    else if (arg.startsWith('--apply-script=')) opts.applyScriptPath = arg.slice(arg.indexOf('=') + 1)
+    else if (arg.startsWith('--protect=')) opts.protectFiles.push(...arg.slice(arg.indexOf('=') + 1).split(','))
+    else if (arg.startsWith('--protect-file=')) opts.protectFile = arg.slice(arg.indexOf('=') + 1)
+    else {
+      throw new Error(
+        `未知参数: ${arg}\n参数需使用 --name=value 形式；可用 --help 查看全部参数`
+      )
+    }
   }
 
   return opts
@@ -76,9 +86,14 @@ async function main () {
     process.exit(0)
   }
 
+  // 仅读取 deploy 元数据，不依赖当前目录的 VCS 类型
   const config = resolveConfig({
     deployDir: opts.deployDir,
-    pkgRoot: path.join(__dirname, '..')
+    applyScriptPath: opts.applyScriptPath || undefined,
+    protectFiles: opts.protectFiles,
+    protectFile: opts.protectFile,
+    pkgRoot: path.join(__dirname, '..'),
+    needsVcs: false
   })
 
   if (opts.listVersions) {
@@ -106,6 +121,7 @@ async function main () {
     fileList: opts.fileList || null,
     noZip: opts.noZip,
     zipPrefix: config.zipPrefix,
+    protectFiles: config.protectFiles,
     registerSubset: Boolean(opts.register)
   })
 
